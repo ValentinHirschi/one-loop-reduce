@@ -5,10 +5,11 @@ use symbolica::domains::rational::Q;
 use symbolica::domains::rational_polynomial::{RationalPolynomial, RationalPolynomialField};
 use symbolica::symbol;
 use symbolica::tensors::matrix::Matrix;
+use symbolica::utils::resources;
 
 use crate::error::OneLoopError;
 use crate::masters::{MasterBasis, MasterIntegral, OneLoopMasters};
-use crate::recurrence::RecurrenceInput;
+use crate::recurrence::{RecurrenceInput, ReductionOptions};
 use crate::symbols::{S, validate_namespace};
 
 mod ibp;
@@ -21,28 +22,19 @@ pub struct Reduction {
 
 impl Reduction {
     /// Reduce every coefficient to lowest terms
-    pub fn simplify(mut self) -> Self {
+    pub fn simplify(mut self) -> Result<Self, OneLoopError> {
         for (coeff, _) in &mut self.terms {
+            resources::checkpoint()?;
             *coeff = coeff.cancel();
         }
-        self
+        resources::checkpoint()?;
+        Ok(self)
     }
 }
 
-/// The largest total propagator index `sum(propagator_exponents)` that can be reduced.
-///
-/// Every level of the recursion drops either one unit of total index or one
-/// propagator, so the stack depth it reaches is bounded by `total + N` -- and a
-/// negative index never bottoms out at all. Overrunning the stack is an *abort*,
-/// not a panic: no `catch_unwind` can intercept it.
-///
-/// Measured on this reducer, debug build, one `reduce_cayley` frame is 3408
-/// bytes and a 2 MiB thread stack dies at depth 486 (an 8 MiB stack at 2323).
-/// Runtime hits the wall far sooner: the tree branches `N(N-1)+1` ways per
-/// level, so a release-build dotted bubble takes 0.05 s at total index 11,
-/// 15 s at 17, and ~2.9x more per unit after that -- a day at 25. 32 therefore
-/// sits an order of magnitude below the overflow floor and far above anything
-/// that would ever have returned an answer.
+/// Suggested total-index ceiling for explicitly enabled work diagnostics.
+/// Ordinary reduction has no such ceiling. Native recursion grows its stack
+/// on the current thread and honors the enclosing RAM/time resource budget.
 pub const MAX_TOTAL_INDEX: i32 = 32;
 
 /// The largest total degree of a numerator in `dot(k,k)` and `dot(k,q_i)`.
@@ -51,43 +43,78 @@ pub const MAX_NUMERATOR_DEGREE: u32 = 20;
 
 /// Reduce a one-loop integral family to the scalar masters `A0`/`B0`/`C0`/`D0`.
 ///
-/// Returns an error, never a wrong answer, for a malformed family, indices
-/// outside [`MAX_TOTAL_INDEX`], an unsupported numerator, or a result that is
-/// not finite.
+/// Returns an error for malformed input, an unsupported numerator, a resource
+/// refusal, or a nonfinite result. Work-count diagnostics are disabled.
 pub fn reduce(family: &RecurrenceInput) -> Result<Reduction, OneLoopError> {
-    crate::record_usage();
-    validate_family(family)?;
-    let exponents = &family.powers;
-    // `checked_add`, not `sum`: `[i32::MAX, i32::MAX]` would wrap past the bound.
-    let total = exponents
-        .iter()
-        .try_fold(0i32, |acc, &e| acc.checked_add(e));
-    if !matches!(total, Some(t) if t <= MAX_TOTAL_INDEX) || exponents.iter().any(|&e| e < 0) {
-        return Err(OneLoopError::UnsupportedIndex {
-            found: exponents.clone(),
-            max: MAX_TOTAL_INDEX,
-        });
-    }
-    check_numerator(&family.numerator, family.masses_squared.len())?;
+    ReductionOptions::default().reduce(family)
+}
 
-    let merged = merge_coincident_lines(family);
-    let family = merged.as_ref().unwrap_or(family);
-    let reduction = if family.invariants.iter().any(|s| s.is_zero()) {
-        reduce_regularized(family)
-    } else {
-        reduce_core(family)
-    };
-    if check_finite(&reduction).is_err() {
-        // The on-shell limit does not exist termwise; solve the IBP system
-        // exactly at the degenerate point instead.
-        if let Some(terms) = ibp::reduce_exact(family) {
-            let exact = Reduction { terms };
-            check_finite(&exact)?;
-            return Ok(exact);
+impl ReductionOptions {
+    pub(crate) fn validate_total(self, powers: &[i32], total: i128) -> Result<(), OneLoopError> {
+        if let Some(limit) = self.diagnostic_max_total_index {
+            if limit < 0 {
+                return Err(OneLoopError::InvalidFamily(
+                    "diagnostic_max_total_index must be nonnegative".into(),
+                ));
+            }
+            if total > i128::from(limit) {
+                return Err(OneLoopError::UnsupportedIndex {
+                    found: powers.to_vec(),
+                    max: limit,
+                });
+            }
         }
+        Ok(())
     }
-    check_finite(&reduction)?;
-    Ok(reduction)
+
+    /// Apply this execution policy to the ordinary recurrence implementation.
+    pub fn reduce(self, family: &RecurrenceInput) -> Result<Reduction, OneLoopError> {
+        resources::checkpoint()?;
+        crate::record_usage();
+        validate_family(family)?;
+        if family.powers.iter().any(|&power| power < 0) {
+            return Err(OneLoopError::InvalidFamily(format!(
+                "unsupported propagator powers {:?}: recurrence indices must be nonnegative",
+                family.powers
+            )));
+        }
+        let total = family.powers.iter().map(|&power| i128::from(power)).sum();
+        self.validate_total(&family.powers, total)?;
+        check_numerator(&family.numerator, family.masses_squared.len())?;
+
+        let merged = merge_coincident_lines(family)?;
+        let family = merged.as_ref().unwrap_or(family);
+        let reduction = if family.invariants.iter().any(|s| s.is_zero()) {
+            reduce_regularized(family)?
+        } else {
+            reduce_core(family)?
+        };
+        if check_finite(&reduction).is_err() {
+            // Preserve the existing exact fallback at the same degenerate point.
+            if let Some(terms) = ibp::reduce_exact(family)? {
+                let exact = Reduction { terms };
+                check_finite(&exact)?;
+                resources::checkpoint()?;
+                return Ok(exact);
+            }
+        }
+        check_finite(&reduction)?;
+        resources::checkpoint()?;
+        Ok(reduction)
+    }
+}
+
+/// Grow only this thread's stack, retaining its ambient budget and Symbolica TLS.
+fn with_stack<T>(work: impl FnOnce() -> Result<T, OneLoopError>) -> Result<T, OneLoopError> {
+    resources::checkpoint()?;
+    const RED_ZONE: usize = 1024 * 1024;
+    const STACK_SIZE: usize = 8 * 1024 * 1024;
+    if stacker::remaining_stack().is_none_or(|remaining| remaining < RED_ZONE) {
+        resources::check_allocation(STACK_SIZE as u64)?;
+    }
+    let value = stacker::maybe_grow(RED_ZONE, STACK_SIZE, work)?;
+    resources::checkpoint()?;
+    Ok(value)
 }
 
 fn validate_family(family: &RecurrenceInput) -> Result<(), OneLoopError> {
@@ -172,6 +199,12 @@ fn check_numerator(numerator: &Atom, n: usize) -> Result<(), OneLoopError> {
                 let Some(e) = var_power(f, &vars) else {
                     return unsupported(format!("not polynomial in the loop dots: {numerator}"));
                 };
+                if e > MAX_NUMERATOR_DEGREE - degree {
+                    return unsupported(format!(
+                        "degree {} exceeds the i64 factorial bound {MAX_NUMERATOR_DEGREE}",
+                        u64::from(degree) + u64::from(e)
+                    ));
+                }
                 degree += e;
             }
         }
@@ -209,10 +242,12 @@ fn var_power(f: AtomView, vars: &[Symbol]) -> Option<u32> {
 /// raised power divides by the vanishing `det(Y)` and the `delta` limit comes
 /// out indeterminate (a dotted bubble at `p^2 = 0`, for instance). Not done
 /// under a numerator, which sees the vectors: an on-shell leg is not zero.
-fn merge_coincident_lines(family: &RecurrenceInput) -> Option<RecurrenceInput> {
+fn merge_coincident_lines(
+    family: &RecurrenceInput,
+) -> Result<Option<RecurrenceInput>, OneLoopError> {
     let exps = &family.powers;
     if family.numerator != Atom::num(1) || exps.iter().all(|&e| e <= 1) {
-        return None;
+        return Ok(None);
     }
     let n = exps.len();
     let masses: Vec<Atom> = family.masses_squared.clone();
@@ -226,7 +261,7 @@ fn merge_coincident_lines(family: &RecurrenceInput) -> Option<RecurrenceInput> {
         .collect();
     let keep: Vec<usize> = (0..n).filter(|&j| rep[j] == j).collect();
     if keep.len() == n {
-        return None;
+        return Ok(None);
     }
     let lex = |i: usize, j: usize| invariants[i * n - i * (i + 1) / 2 + j - i - 1].clone();
     let mut out = family.clone();
@@ -236,14 +271,22 @@ fn merge_coincident_lines(family: &RecurrenceInput) -> Option<RecurrenceInput> {
         .collect();
     out.powers = keep
         .iter()
-        .map(|&i| (0..n).filter(|&j| rep[j] == i).map(|j| exps[j]).sum())
-        .collect();
+        .map(|&i| {
+            (0..n).filter(|&j| rep[j] == i).try_fold(0i32, |sum, j| {
+                sum.checked_add(exps[j]).ok_or_else(|| {
+                    OneLoopError::InvalidFamily(
+                        "a merged propagator index exceeds the i32 representation".into(),
+                    )
+                })
+            })
+        })
+        .collect::<Result<_, _>>()?;
     out.invariants = keep
         .iter()
         .enumerate()
         .flat_map(|(a, &i)| keep[a + 1..].iter().map(move |&j| lex(i, j)))
         .collect();
-    Some(out)
+    Ok(Some(out))
 }
 
 fn check_finite(reduction: &Reduction) -> Result<(), OneLoopError> {
@@ -310,7 +353,8 @@ fn master_at_zero(m: &MasterIntegral, delta: &Atom) -> MasterIntegral {
 }
 
 /// Off-shell regularization for on-shell massless legs
-fn reduce_regularized(family: &RecurrenceInput) -> Reduction {
+fn reduce_regularized(family: &RecurrenceInput) -> Result<Reduction, OneLoopError> {
+    resources::checkpoint()?;
     let delta = Atom::var(symbol!("oneloopmaster::reg_delta"));
     let mut reg = family.clone();
     reg.invariants = family
@@ -324,7 +368,7 @@ fn reduce_regularized(family: &RecurrenceInput) -> Reduction {
             }
         })
         .collect();
-    let reduced = reduce_core(&reg);
+    let reduced = reduce_core(&reg)?;
     let terms = reduced
         .terms
         .iter()
@@ -338,10 +382,12 @@ fn reduce_regularized(family: &RecurrenceInput) -> Reduction {
         })
         .filter(|(c, _)| *c != Atom::Zero)
         .collect();
-    Reduction { terms }
+    resources::checkpoint()?;
+    Ok(Reduction { terms })
 }
 
-fn reduce_core(family: &RecurrenceInput) -> Reduction {
+fn reduce_core(family: &RecurrenceInput) -> Result<Reduction, OneLoopError> {
+    resources::checkpoint()?;
     let inv = |i: usize| family.invariants.get(i).cloned().unwrap_or(Atom::Zero);
     let mass = |i: usize| family.masses_squared[i].clone();
     let exponents = &family.powers;
@@ -365,11 +411,11 @@ fn reduce_core(family: &RecurrenceInput) -> Reduction {
             let m_sq = mass(0);
             if family.numerator == Atom::num(1) {
                 vec![(
-                    tadpole_coefficient(exponents[0], &m_sq),
+                    tadpole_coefficient(exponents[0], &m_sq)?,
                     MasterIntegral::Tadpole { m_sq },
                 )]
             } else {
-                tadpole_numerator(&family.numerator, exponents[0], &m_sq)
+                tadpole_numerator(&family.numerator, exponents[0], &m_sq)?
             }
         }
         2 => {
@@ -378,7 +424,7 @@ fn reduce_core(family: &RecurrenceInput) -> Reduction {
             let m2_sq = mass(1);
             if family.numerator == Atom::num(1) {
                 let m = [m1_sq, m2_sq];
-                reduce_cayley(&modified_cayley(&m, &[p_sq]), &m, exponents)
+                reduce_cayley(&modified_cayley(&m, &[p_sq]), &m, exponents)?
             } else {
                 let (c_b0, c_a1, c_a2) = bubble_numerator(
                     &family.numerator,
@@ -387,7 +433,7 @@ fn reduce_core(family: &RecurrenceInput) -> Reduction {
                     &p_sq,
                     &m1_sq,
                     &m2_sq,
-                );
+                )?;
                 let mut terms = Vec::new();
                 push_nonzero(
                     &mut terms,
@@ -408,7 +454,7 @@ fn reduce_core(family: &RecurrenceInput) -> Reduction {
                 // Triangle invariants (s1,s2,s3)
                 let masses: Vec<Atom> = (0..3).map(mass).collect();
                 let lex = [inv(0), inv(1), inv(2)];
-                reduce_cayley(&modified_cayley(&masses, &lex), &masses, exponents)
+                reduce_cayley(&modified_cayley(&masses, &lex), &masses, exponents)?
             } else {
                 triangle_numerator(
                     &family.numerator,
@@ -421,7 +467,7 @@ fn reduce_core(family: &RecurrenceInput) -> Reduction {
                     &mass(0),
                     &mass(1),
                     &mass(2),
-                )
+                )?
             }
         }
         4 => {
@@ -429,7 +475,7 @@ fn reduce_core(family: &RecurrenceInput) -> Reduction {
                 // Box invariants (p1,p2,p3,p4,s,t)
                 let masses: Vec<Atom> = (0..4).map(mass).collect();
                 let lex = [inv(0), inv(1), inv(2), inv(3), inv(4), inv(5)];
-                reduce_cayley(&modified_cayley(&masses, &lex), &masses, exponents)
+                reduce_cayley(&modified_cayley(&masses, &lex), &masses, exponents)?
             } else {
                 box_numerator(
                     &family.numerator,
@@ -447,34 +493,36 @@ fn reduce_core(family: &RecurrenceInput) -> Reduction {
                     &mass(1),
                     &mass(2),
                     &mass(3),
-                )
+                )?
             }
         }
         n => {
             // N > 4: van Neerven-Vermaseren / FJT-Tarasov reduction to boxes.
             let masses: Vec<Atom> = (0..n).map(mass).collect();
             if family.numerator != Atom::num(1) {
-                ngon_numerator(&family.numerator, exponents, &family.invariants, &masses)
+                ngon_numerator(&family.numerator, exponents, &family.invariants, &masses)?
             } else {
                 let y = modified_cayley(&masses, &family.invariants);
-                reduce_cayley(&y, &masses, exponents)
+                reduce_cayley(&y, &masses, exponents)?
             }
         }
     };
 
-    Reduction { terms }
+    resources::checkpoint()?;
+    Ok(Reduction { terms })
 }
 
-fn tadpole_coefficient(exponent: i32, m_sq: &Atom) -> Atom {
+fn tadpole_coefficient(exponent: i32, m_sq: &Atom) -> Result<Atom, OneLoopError> {
     if exponent <= 0 || *m_sq == Atom::Zero {
-        return Atom::Zero;
+        return Ok(Atom::Zero);
     }
     let d = Atom::var(S.d);
     let mut coeff = Atom::num(1);
     for k in 1..i64::from(exponent) {
+        resources::checkpoint()?;
         coeff = coeff * (&d - Atom::num(2 * k)) / (Atom::num(2 * k) * m_sq);
     }
-    coeff
+    Ok(coeff)
 }
 
 fn push_nonzero(terms: &mut Vec<(Atom, MasterIntegral)>, coeff: Atom, master: MasterIntegral) {
@@ -696,7 +744,15 @@ fn reduce_cayley(
     y: &[Vec<Atom>],
     masses: &[Atom],
     exponents: &[i32],
-) -> Vec<(Atom, MasterIntegral)> {
+) -> Result<Masters, OneLoopError> {
+    with_stack(|| reduce_cayley_inner(y, masses, exponents))
+}
+
+fn reduce_cayley_inner(
+    y: &[Vec<Atom>],
+    masses: &[Atom],
+    exponents: &[i32],
+) -> Result<Masters, OneLoopError> {
     let drop = |i: usize, v: &[Atom]| -> Vec<Atom> {
         v.iter()
             .enumerate()
@@ -706,11 +762,11 @@ fn reduce_cayley(
     };
     let n = y.len();
     if n == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     if n == 1 {
-        let c = tadpole_coefficient(exponents[0], &masses[0]);
-        return if c == Atom::Zero {
+        let c = tadpole_coefficient(exponents[0], &masses[0])?;
+        return Ok(if c == Atom::Zero {
             Vec::new()
         } else {
             vec![(
@@ -719,7 +775,7 @@ fn reduce_cayley(
                     m_sq: masses[0].clone(),
                 },
             )]
-        };
+        });
     }
     if exponents.contains(&0) {
         let z = exponents.iter().position(|&e| e == 0).unwrap();
@@ -733,7 +789,7 @@ fn reduce_cayley(
     }
     if exponents.iter().all(|&e| e == 1) {
         if n <= 4 {
-            return emit_master(y, masses);
+            return Ok(emit_master(y, masses));
         }
         let ones = vec![1; n - 1];
         let mut terms = Vec::new();
@@ -741,10 +797,10 @@ fn reduce_cayley(
             add_scaled(
                 &mut terms,
                 c_i,
-                reduce_cayley(&delete_row_col(y, i, i), &drop(i, masses), &ones),
+                reduce_cayley(&delete_row_col(y, i, i), &drop(i, masses), &ones)?,
             );
         }
-        return terms;
+        return Ok(terms);
     }
 
     let det_y = det(y);
@@ -756,9 +812,9 @@ fn reduce_cayley(
             }
             let mut a2 = exponents.to_vec();
             a2[l] -= 1;
-            add_scaled(&mut terms, cl, reduce_cayley(y, masses, &a2));
+            add_scaled(&mut terms, cl, reduce_cayley(y, masses, &a2)?);
         }
-        return terms;
+        return Ok(terms);
     }
 
     // dotted: FJT/Tarasov index-lowering
@@ -770,7 +826,7 @@ fn reduce_cayley(
     }
     let mut a = exponents.to_vec();
     a[k] -= 1;
-    let total: i32 = a.iter().sum();
+    let total: Atom = a.iter().map(|&power| Atom::num(i64::from(power))).sum();
     // inv[k][i] = adj[k][i]/det(y)
     let inv = matrix_inv(y);
     let den = Atom::num(i64::from(a[k]));
@@ -778,11 +834,11 @@ fn reduce_cayley(
     let d = Atom::var(S.d);
     let mut diag = Atom::Zero;
     for i in 0..n {
-        let factor = &d - Atom::num(i64::from(total + a[i]));
+        let factor = &d - &total - Atom::num(i64::from(a[i]));
         diag += &inv[k][i] * &factor;
     }
     let mut acc = Vec::new();
-    add_scaled(&mut acc, &(diag / &den), reduce_cayley(y, masses, &a));
+    add_scaled(&mut acc, &(diag / &den), reduce_cayley(y, masses, &a)?);
     for i in 0..n {
         for j in 0..n {
             if i == j {
@@ -790,12 +846,16 @@ fn reduce_cayley(
             }
             let num = Atom::num(i64::from(-a[j])) * &inv[k][i];
             let mut ch = a.clone();
-            ch[j] += 1;
+            ch[j] = ch[j].checked_add(1).ok_or_else(|| {
+                OneLoopError::InvalidFamily(
+                    "a recurrence propagator index exceeds the i32 representation".into(),
+                )
+            })?;
             ch[i] -= 1;
-            add_scaled(&mut acc, &(num / &den), reduce_cayley(y, masses, &ch));
+            add_scaled(&mut acc, &(num / &den), reduce_cayley(y, masses, &ch)?);
         }
     }
-    acc
+    Ok(acc)
 }
 
 type DotMono = (Vec<i32>, Atom);
@@ -824,54 +884,67 @@ fn loop_dots_to_vars(numerator: &Atom, n_ext: usize) -> (Atom, Vec<Symbol>) {
     (n, vars)
 }
 
-fn numerator_to_monos(numerator: &Atom, n_ext: usize) -> Vec<DotMono> {
+fn numerator_to_monos(numerator: &Atom, n_ext: usize) -> Result<Vec<DotMono>, OneLoopError> {
     let (n, vars) = loop_dots_to_vars(numerator, n_ext);
     extract_monomials(&n, &vars)
 }
 
 // Monomials of a polynomial in `vars`
-fn extract_monomials(expr: &Atom, vars: &[Symbol]) -> Vec<DotMono> {
-    fn rec(expr: &Atom, vars: &[Symbol], idx: usize, exps: &mut Vec<i32>, out: &mut Vec<DotMono>) {
-        if idx == vars.len() {
-            if *expr != Atom::Zero {
-                out.push((exps.clone(), expr.clone()));
+fn extract_monomials(expr: &Atom, vars: &[Symbol]) -> Result<Vec<DotMono>, OneLoopError> {
+    fn rec(
+        expr: &Atom,
+        vars: &[Symbol],
+        idx: usize,
+        exps: &mut Vec<i32>,
+        out: &mut Vec<DotMono>,
+    ) -> Result<(), OneLoopError> {
+        with_stack(|| {
+            if idx == vars.len() {
+                if *expr != Atom::Zero {
+                    out.push((exps.clone(), expr.clone()));
+                }
+                return Ok(());
             }
-            return;
-        }
-        let v = vars[idx];
-        let vatom = Atom::var(v);
-        // Peel off powers of `v` one at a time via Taylor coefficients:
-        //   coeff of v^c = (1/c!) d^c/dv^c expr |_{v=0}
-        let mut deriv = expr.clone();
-        let mut factorial: i64 = 1;
-        let mut c = 0i32;
-        loop {
-            // coefficient of v^c is (deriv with v->0) / factorial
-            let at_zero = deriv.replace(vatom.to_pattern()).with(Atom::Zero);
-            if at_zero != Atom::Zero {
-                let coeff = at_zero / Atom::num(factorial);
-                exps[idx] = c;
-                rec(&coeff, vars, idx + 1, exps, out);
+            let v = vars[idx];
+            let vatom = Atom::var(v);
+            // Peel off powers of `v` one at a time via Taylor coefficients:
+            //   coeff of v^c = (1/c!) d^c/dv^c expr |_{v=0}
+            let mut deriv = expr.clone();
+            let mut factorial: i64 = 1;
+            let mut c = 0i32;
+            loop {
+                resources::checkpoint()?;
+                // coefficient of v^c is (deriv with v->0) / factorial
+                let at_zero = deriv.replace(vatom.to_pattern()).with(Atom::Zero);
+                if at_zero != Atom::Zero {
+                    let coeff = at_zero / Atom::num(factorial);
+                    exps[idx] = c;
+                    rec(&coeff, vars, idx + 1, exps, out)?;
+                }
+                // step to next power
+                let next = deriv.derivative(v);
+                if next == Atom::Zero {
+                    break;
+                }
+                deriv = next;
+                c += 1;
+                if c > MAX_NUMERATOR_DEGREE as i32 {
+                    return Err(OneLoopError::UnsupportedNumerator {
+                        reason: format!(
+                            "numerator degree in one variable exceeds the i64 factorial bound ({MAX_NUMERATOR_DEGREE})"
+                        ),
+                    });
+                }
+                factorial *= i64::from(c);
             }
-            // step to next power
-            let next = deriv.derivative(v);
-            if next == Atom::Zero {
-                break;
-            }
-            deriv = next;
-            c += 1;
-            assert!(
-                c <= 20,
-                "numerator degree in one variable exceeds the supported bound (20)"
-            );
-            factorial *= i64::from(c);
-        }
-        exps[idx] = 0;
+            exps[idx] = 0;
+            Ok(())
+        })
     }
     let mut out = Vec::new();
     let mut exps = vec![0i32; vars.len()];
-    rec(expr, vars, 0, &mut exps, &mut out);
-    out
+    rec(expr, vars, 0, &mut exps, &mut out)?;
+    Ok(out)
 }
 
 // A direction in external-momentum space: integer coefficients over (q1,...,q_{n_ext}).
@@ -882,9 +955,9 @@ type GramFn = Box<dyn Fn(usize, usize) -> Atom>;
 // A reduction result: a list of (coefficient, master integral).
 type Masters = Vec<(Atom, MasterIntegral)>;
 // Scalar reducer for a topology: propagator exponents -> masters.
-type ScalarFn = Box<dyn Fn(&[i32]) -> Masters>;
+type ScalarFn = Box<dyn Fn(&[i32]) -> Result<Masters, OneLoopError>>;
 // Pinch routine: (kept lines, their exponents, residual dot-polynomial) -> masters.
-type PinchFn = Box<dyn Fn(&[usize], &[i32], &[DotMono]) -> Masters>;
+type PinchFn = Box<dyn Fn(&[usize], &[i32], &[DotMono]) -> Result<Masters, OneLoopError>>;
 
 // A topology level for arbitrary-rank numerator reduction.
 struct Topo {
@@ -973,32 +1046,36 @@ fn independent_gram_subset(g: &[Vec<Atom>]) -> Vec<usize> {
 
 // All perfect matchings (pairings) of 0..m (m even).  Each pairing is a Vec of
 // (i,j) index pairs.
-fn pairings(items: &[usize]) -> Vec<Vec<(usize, usize)>> {
-    if items.is_empty() {
-        return vec![vec![]];
-    }
-    let first = items[0];
-    let mut out = Vec::new();
-    for i in 1..items.len() {
-        let mut rest = Vec::with_capacity(items.len() - 2);
-        for (j, &it) in items.iter().enumerate() {
-            if j != 0 && j != i {
-                rest.push(it);
+fn pairings(items: &[usize]) -> Result<Vec<Vec<(usize, usize)>>, OneLoopError> {
+    with_stack(|| {
+        if items.is_empty() {
+            return Ok(vec![vec![]]);
+        }
+        let first = items[0];
+        let mut out = Vec::new();
+        for i in 1..items.len() {
+            let mut rest = Vec::with_capacity(items.len() - 2);
+            for (j, &it) in items.iter().enumerate() {
+                if j != 0 && j != i {
+                    rest.push(it);
+                }
+            }
+            for mut sub in pairings(&rest)? {
+                resources::checkpoint()?;
+                sub.insert(0, (first, items[i]));
+                out.push(sub);
             }
         }
-        for mut sub in pairings(&rest) {
-            sub.insert(0, (first, items[i]));
-            out.push(sub);
-        }
-    }
-    out
+        Ok(out)
+    })
 }
 
 // Step 1: PV transverse average.  Split each loop dot into a reducible part
 // (par = sum alpha_ab dot(k,q_b)) plus an ISP part xi; average even xi products over
 // pairings of the transverse metric in n_t = d-|rsp| dims.
 #[allow(clippy::assign_op_pattern)]
-fn isp_project(topo: &Topo, monos: &[DotMono]) -> Vec<DotMono> {
+fn isp_project(topo: &Topo, monos: &[DotMono]) -> Result<Vec<DotMono>, OneLoopError> {
+    resources::checkpoint()?;
     let d = Atom::var(S.d);
     let n_rsp = topo.rsp_dirs.len();
     let n_out = n_rsp + 1; // output DotMono length: l.l slot + one per reducible direction
@@ -1067,6 +1144,7 @@ fn isp_project(topo: &Topo, monos: &[DotMono]) -> Vec<DotMono> {
 
     let mut result: Vec<DotMono> = Vec::new();
     for (exps, coeff) in monos {
+        resources::checkpoint()?;
         let ll_pow = exps[0];
         // factors: the multiset of unit external directions from the q-dots.
         let mut factors: Vec<Dir> = Vec::new();
@@ -1093,7 +1171,7 @@ fn isp_project(topo: &Topo, monos: &[DotMono]) -> Vec<DotMono> {
                     ek[j + 1] += 1;
                     par_poly.push((ek, c.clone()));
                 }
-                next.push((mono_mul(poly, &par_poly), xis.clone()));
+                next.push((mono_mul(poly, &par_poly)?, xis.clone()));
                 // xi branch (only if the direction is a genuine ISP)
                 if !reducible {
                     let mut new_xis = xis.clone();
@@ -1111,7 +1189,7 @@ fn isp_project(topo: &Topo, monos: &[DotMono]) -> Vec<DotMono> {
             let kk = m / 2;
             let idxs: Vec<usize> = (0..m).collect();
             let mut s = Atom::Zero;
-            for pr in pairings(&idxs) {
+            for pr in pairings(&idxs)? {
                 let mut term = Atom::num(1);
                 for (i, j) in pr {
                     term *= perp_metric(&xis[i], &xis[j]);
@@ -1128,14 +1206,14 @@ fn isp_project(topo: &Topo, monos: &[DotMono]) -> Vec<DotMono> {
             let avg_coeff = s / &norm;
             let mut piece = poly.clone();
             for _ in 0..kk {
-                piece = mono_mul(&piece, &l2perp);
+                piece = mono_mul(&piece, &l2perp)?;
             }
             for (e, c) in &piece {
                 push_mono(&mut result, e.clone(), &avg_coeff * c);
             }
         }
     }
-    result
+    Ok(result)
 }
 
 fn dir_in_span(dirs: &[Dir], v: &Dir) -> bool {
@@ -1221,15 +1299,16 @@ fn reduce_against(row: &mut [i64], basis: &[Vec<i64>]) {
 }
 
 // Multiply two dot-polynomials.
-fn mono_mul(a: &[DotMono], b: &[DotMono]) -> Vec<DotMono> {
+fn mono_mul(a: &[DotMono], b: &[DotMono]) -> Result<Vec<DotMono>, OneLoopError> {
     let mut out: Vec<DotMono> = Vec::new();
     for (ea, ca) in a {
         for (eb, cb) in b {
+            resources::checkpoint()?;
             let e: Vec<i32> = ea.iter().zip(eb).map(|(x, y)| x + y).collect();
             push_mono(&mut out, e, ca * cb);
         }
     }
-    out
+    Ok(out)
 }
 
 fn push_mono(acc: &mut Vec<DotMono>, e: Vec<i32>, c: Atom) {
@@ -1272,9 +1351,9 @@ fn shift_numerator(
     monos: &[DotMono],
     r: &Dir,
     gram: &dyn Fn(usize, usize) -> Atom,
-) -> Vec<DotMono> {
+) -> Result<Vec<DotMono>, OneLoopError> {
     if r.iter().all(|&x| x == 0) {
-        return monos.to_vec();
+        return Ok(monos.to_vec());
     }
     let n_ext = r.len();
     let n_dots = n_ext + 1;
@@ -1311,18 +1390,18 @@ fn shift_numerator(
         // build the shifted product: ll_shift^{e0} * prod_a lq_shift(a)^{e_{a+1}}
         let mut prod: Vec<DotMono> = vec![(vec![0i32; n_dots], c.clone())];
         for _ in 0..e[0] {
-            prod = mono_mul(&prod, &ll_shift);
+            prod = mono_mul(&prod, &ll_shift)?;
         }
         for a in 0..n_ext {
             for _ in 0..e[a + 1] {
-                prod = mono_mul(&prod, &lq_shift(a));
+                prod = mono_mul(&prod, &lq_shift(a))?;
             }
         }
         for (pe, pc) in prod {
             push_mono(&mut out, pe, pc);
         }
     }
-    out
+    Ok(out)
 }
 
 // Re-express the inverse propagator D_i = dot(k,k) + 2 dot(k,r_i) + (r_i.r_i - m_i) as a dot-polynomial.
@@ -1354,17 +1433,22 @@ fn di_as_dots(r_coeff: &[i32], mass: &Atom, gram: &dyn Fn(usize, usize) -> Atom)
 
 // The generic engine: reduce a dot-polynomial numerator on topology `topo`.
 #[allow(clippy::needless_range_loop)]
-fn reduce_num(topo: &Topo, numerator_monos: &[DotMono]) -> Vec<(Atom, MasterIntegral)> {
+fn reduce_num(topo: &Topo, numerator_monos: &[DotMono]) -> Result<Masters, OneLoopError> {
+    with_stack(|| reduce_num_inner(topo, numerator_monos))
+}
+
+fn reduce_num_inner(topo: &Topo, numerator_monos: &[DotMono]) -> Result<Masters, OneLoopError> {
     // Step 1: ISP projection (no-op for the top topology).
-    let projected = isp_project(topo, numerator_monos);
+    let projected = isp_project(topo, numerator_monos)?;
     if projected.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // Step 2: RSP substitution (slot 0 -> rule_ll, slot j+1 -> rule_lq[j]) -> polynomial in den symbols.
     let n_lines = topo.den_syms.len();
     let mut n = Atom::Zero;
     for (e, c) in &projected {
+        resources::checkpoint()?;
         let mut term = c.clone();
         for _ in 0..e[0] {
             term = &term * &topo.rule_ll;
@@ -1378,18 +1462,19 @@ fn reduce_num(topo: &Topo, numerator_monos: &[DotMono]) -> Vec<(Atom, MasterInte
     }
 
     // Step 3: extract den-monomials.
-    let den_monos = extract_monomials(&n, &topo.den_syms);
+    let den_monos = extract_monomials(&n, &topo.den_syms)?;
 
     // Step 4: route each monomial.
     let mut acc: Vec<(Atom, MasterIntegral)> = Vec::new();
     for (cexp, coeff) in den_monos {
+        resources::checkpoint()?;
         let mut b = topo.a.clone();
         for i in 0..n_lines {
             b[i] -= cexp[i];
         }
         if b.iter().all(|&x| x >= 0) {
             // pure propagator shift
-            add_scaled(&mut acc, &coeff, (topo.scalar)(&b));
+            add_scaled(&mut acc, &coeff, (topo.scalar)(&b)?);
         } else {
             // pinch lines with b_i <= 0; residual prod D_i^{|b_i|} on survivors.
             let keep: Vec<usize> = (0..n_lines).filter(|&i| b[i] > 0).collect();
@@ -1397,18 +1482,22 @@ fn reduce_num(topo: &Topo, numerator_monos: &[DotMono]) -> Vec<(Atom, MasterInte
             // build residual dot-polynomial (in this topology's external basis)
             let n_ext = topo.r_coeffs.first().map_or(0, |r| r.len());
             let mut residual: Vec<DotMono> = vec![(vec![0i32; n_ext + 1], Atom::num(1))];
-            for i in 0..n_lines {
-                if b[i] < 0 {
+            for (i, &power) in b.iter().enumerate().take(n_lines) {
+                if power < 0 {
                     let di = di_as_dots(&topo.r_coeffs[i], &topo.masses[i], &*topo.base_gram);
-                    for _ in 0..(-b[i]) {
-                        residual = mono_mul(&residual, &di);
+                    for _ in 0..(-power) {
+                        residual = mono_mul(&residual, &di)?;
                     }
                 }
             }
-            add_scaled(&mut acc, &coeff, (topo.pinch)(&keep, &keep_exps, &residual));
+            add_scaled(
+                &mut acc,
+                &coeff,
+                (topo.pinch)(&keep, &keep_exps, &residual)?,
+            );
         }
     }
-    acc
+    Ok(acc)
 }
 
 // --- Topology builders -----------------------------------------------------
@@ -1418,7 +1507,7 @@ fn den_symbol(i: usize) -> Symbol {
 }
 
 // Reduce a tadpole numerator
-fn tadpole_numerator(numerator: &Atom, a1: i32, m_sq: &Atom) -> Vec<(Atom, MasterIntegral)> {
+fn tadpole_numerator(numerator: &Atom, a1: i32, m_sq: &Atom) -> Result<Masters, OneLoopError> {
     // A tadpole's loop momentum carries no external offset, so every external
     // contraction dot(k, q_i) is an irreducible scalar product.
     let n_ext = 3;
@@ -1431,7 +1520,7 @@ fn tadpole_numerator(numerator: &Atom, a1: i32, m_sq: &Atom) -> Vec<(Atom, Maste
     });
     reduce_num(
         &tadpole_topo(a1, m_sq, sym_gram, n_ext),
-        &numerator_to_monos(numerator, n_ext),
+        &numerator_to_monos(numerator, n_ext)?,
     )
 }
 
@@ -1443,11 +1532,11 @@ fn bubble_numerator(
     p_sq: &Atom,
     m1_sq: &Atom,
     m2_sq: &Atom,
-) -> (Atom, Atom, Atom) {
+) -> Result<(Atom, Atom, Atom), OneLoopError> {
     let terms = reduce_num(
         &bubble_topo(a1, a2, p_sq, m1_sq, m2_sq),
-        &numerator_to_monos(numerator, 3),
-    );
+        &numerator_to_monos(numerator, 3)?,
+    )?;
     let mut c_b0 = Atom::Zero;
     let mut c_a1 = Atom::Zero;
     let mut c_a2 = Atom::Zero;
@@ -1459,7 +1548,7 @@ fn bubble_numerator(
             _ => unreachable!("bubble numerator produced an unexpected master"),
         }
     }
-    (c_b0, c_a1, c_a2)
+    Ok((c_b0, c_a1, c_a2))
 }
 
 fn bubble_topo(a1: i32, a2: i32, p_sq: &Atom, m1_sq: &Atom, m2_sq: &Atom) -> Topo {
@@ -1600,10 +1689,10 @@ fn triangle_numerator(
     m1: &Atom,
     m2: &Atom,
     m3: &Atom,
-) -> Vec<(Atom, MasterIntegral)> {
+) -> Result<Masters, OneLoopError> {
     reduce_num(
         &triangle_topo(a1, a2, a3, s1, s2, s3, m1, m2, m3),
-        &numerator_to_monos(numerator, 3),
+        &numerator_to_monos(numerator, 3)?,
     )
 }
 
@@ -1697,15 +1786,15 @@ fn pinch_to_subtopo(
     all_r: &[Dir],
     all_masses: &[Atom],
     base_gram: &dyn Fn(usize, usize) -> Atom,
-) -> Vec<(Atom, MasterIntegral)> {
+) -> Result<Masters, OneLoopError> {
     if keep.is_empty() {
         // No denominator survives
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let r_ref = all_r[keep[0]].clone();
     let n_ext = r_ref.len();
     // Shift the residual into the child's reference frame
-    let shifted = shift_numerator(num, &r_ref, base_gram);
+    let shifted = shift_numerator(num, &r_ref, base_gram)?;
     // Surviving line shift-directions relative to the reference, and masses.
     let dirs: Vec<Dir> = keep
         .iter()
@@ -1802,16 +1891,16 @@ fn tadpole_topo(
         scalar: Box::new(move |b| {
             // A0 with exponent <= 0 is a scaleless integral (no scale) -> 0.
             if b[0] <= 0 {
-                return Vec::new();
+                return Ok(Vec::new());
             }
-            let coeff = tadpole_coefficient(b[0], &m);
-            if coeff == Atom::Zero {
+            let coeff = tadpole_coefficient(b[0], &m)?;
+            Ok(if coeff == Atom::Zero {
                 Vec::new()
             } else {
                 vec![(coeff, MasterIntegral::Tadpole { m_sq: m.clone() })]
-            }
+            })
         }),
-        pinch: Box::new(|_, _, _| Vec::new()),
+        pinch: Box::new(|_, _, _| Ok(Vec::new())),
     }
 }
 
@@ -1833,10 +1922,10 @@ fn box_numerator(
     m2: &Atom,
     m3: &Atom,
     m4: &Atom,
-) -> Vec<(Atom, MasterIntegral)> {
+) -> Result<Masters, OneLoopError> {
     reduce_num(
         &box_topo(a1, a2, a3, a4, p1, p2, p3, p4, s, t, m1, m2, m3, m4),
-        &numerator_to_monos(numerator, 3),
+        &numerator_to_monos(numerator, 3)?,
     )
 }
 
@@ -1995,7 +2084,7 @@ fn ngon_numerator(
     exps: &[i32],
     invariants: &[Atom],
     masses: &[Atom],
-) -> Vec<(Atom, MasterIntegral)> {
+) -> Result<Masters, OneLoopError> {
     let n = masses.len();
     let n_ext = n - 1;
     // Standard offsets r_i = q1 + ... + q_{i-1}, as directions over (q1..q_{n_ext}).
@@ -2009,7 +2098,7 @@ fn ngon_numerator(
             masses,
             base_gram_from_pairwise(n_ext, invariants),
         ),
-        &numerator_to_monos(numerator, n_ext),
+        &numerator_to_monos(numerator, n_ext)?,
     )
 }
 
@@ -2872,16 +2961,19 @@ mod tests {
         ));
     }
 
-    /// The bound is checked before the recursion is entered, because a stack
-    /// overflow is an abort and nothing downstream can catch it.
+    /// An explicit diagnostic grant rejects work before entering recurrence.
     #[test]
-    fn rejects_a_total_index_that_would_exhaust_the_stack() {
+    fn explicit_total_index_diagnostics_reject_before_recurrence() {
         crate::ensure_symbolica_license();
         let psq = Atom::var(S.psq);
         // The last one wraps to -2 under plain `sum`, so it also pins `checked_add`.
         for e in [vec![5000, 1], vec![i32::MAX, i32::MAX]] {
             let fam = family(vec![Atom::Zero, Atom::Zero], vec![psq.clone()], e);
-            let err = reduce(&fam).unwrap_err().to_string();
+            let err = crate::ReductionOptions::default()
+                .with_diagnostics()
+                .reduce(&fam)
+                .unwrap_err()
+                .to_string();
             assert!(err.contains(&format!("at most {MAX_TOTAL_INDEX}")), "{err}");
         }
     }
@@ -2889,12 +2981,107 @@ mod tests {
     /// A massless tadpole bottoms out without recursing, so it can sit exactly on
     /// the bound and pin the off-by-one that a real reduction is far too slow to.
     #[test]
-    fn accepts_exactly_the_bound_and_refuses_one_past_it() {
+    fn total_index_diagnostics_are_disabled_by_default_and_keep_their_boundary() {
         crate::ensure_symbolica_license();
         let at = family(vec![Atom::Zero], vec![], vec![MAX_TOTAL_INDEX]);
         let past = family(vec![Atom::Zero], vec![], vec![MAX_TOTAL_INDEX + 1]);
         assert!(reduce(&at).is_ok());
-        assert!(reduce(&past).is_err());
+        assert!(reduce(&past).is_ok());
+        let options = crate::ReductionOptions::default().with_diagnostics();
+        assert!(options.reduce(&at).is_ok());
+        assert!(options.reduce(&past).is_err());
+        for power in [5000, i32::MAX] {
+            assert!(reduce(&family(vec![Atom::Zero], vec![], vec![power])).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_real_resource_refusal_aborts_uncapped_work_and_keeps_later_requests_healthy() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use symbolica::utils::resources::{ResourceBudget, ResourceLimitError, ResourceLimits};
+
+        crate::ensure_symbolica_license();
+        let input = family(vec![Atom::num(2)], vec![], vec![5000]);
+        let polls = AtomicUsize::new(0);
+        const LIMIT: u64 = 64 * 1024 * 1024;
+        let budget = ResourceBudget::with_memory_monitor(
+            ResourceLimits {
+                max_process_rss_bytes: Some(LIMIT),
+                ..Default::default()
+            },
+            move || {
+                Ok(if polls.fetch_add(1, Ordering::Relaxed) < 40 {
+                    0
+                } else {
+                    LIMIT + 1
+                })
+            },
+        );
+        let error = budget.run(|| reduce(&input)).unwrap_err();
+        assert!(matches!(
+            std::error::Error::source(&error).and_then(|cause| cause.downcast_ref::<ResourceLimitError>()),
+            Some(ResourceLimitError::Memory { rss_bytes, additional_bytes: 0, limit_bytes })
+                if *rss_bytes == LIMIT + 1 && *limit_bytes == LIMIT
+        ));
+        let healthy = family(vec![Atom::num(2)], vec![], vec![2]);
+        assert!(!reduce(&healthy).unwrap().terms.is_empty());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn growing_the_recurrence_stack_preserves_thread_and_resource_scope() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread::ThreadId;
+        use symbolica::utils::resources::{ResourceBudget, ResourceLimitError, ResourceLimits};
+
+        fn descend(depth: usize, thread: ThreadId) -> Result<(), crate::OneLoopError> {
+            super::with_stack(|| {
+                let frame = [depth as u8; 8192];
+                assert_eq!(std::thread::current().id(), thread);
+                if depth != 0 {
+                    descend(depth - 1, thread)?;
+                }
+                std::hint::black_box(frame);
+                Ok(())
+            })
+        }
+        fn on_small_stack(thread: ThreadId) -> Result<(), crate::OneLoopError> {
+            const INITIAL_STACK: usize = 2 * 1024 * 1024;
+            symbolica::utils::resources::check_allocation(INITIAL_STACK as u64)?;
+            // Fix the initial size even when the test runner has a large stack.
+            stacker::grow(INITIAL_STACK, || descend(1200, thread))
+        }
+        let thread = std::thread::current().id();
+        const LIMIT: u64 = 64 * 1024 * 1024;
+        ResourceBudget::with_memory_monitor(
+            ResourceLimits {
+                max_process_rss_bytes: Some(LIMIT),
+                ..Default::default()
+            },
+            || Ok(0),
+        )
+        .run(|| on_small_stack(thread))
+        .unwrap();
+        let polls = AtomicUsize::new(0);
+        let error = ResourceBudget::with_memory_monitor(
+            ResourceLimits {
+                max_process_rss_bytes: Some(LIMIT),
+                ..Default::default()
+            },
+            move || {
+                Ok(if polls.fetch_add(1, Ordering::Relaxed) < 1000 {
+                    0
+                } else {
+                    LIMIT + 1
+                })
+            },
+        )
+        .run(|| on_small_stack(thread))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::OneLoopError::Resource(ResourceLimitError::Memory { .. })
+        ));
     }
 
     /// Dotted lines still reduce, and to the right thing: the massless bubble has
@@ -2921,7 +3108,8 @@ mod tests {
                 exponents.clone(),
             ))
             .unwrap()
-            .simplify();
+            .simplify()
+            .unwrap();
             assert_eq!(r.terms.len(), 1, "{exponents:?}");
             let (got, master) = &r.terms[0];
             assert_eq!(
@@ -2950,7 +3138,8 @@ mod tests {
                 / (Atom::num(48) * &m6);
             let tadpole = reduce(&family(vec![mass.clone()], vec![], vec![4]))
                 .unwrap()
-                .simplify();
+                .simplify()
+                .unwrap();
             assert_eq!((&tadpole.terms[0].0 - &want).expand(), Atom::Zero);
             for exponents in [vec![2, 2], vec![3, 1], vec![1, 3]] {
                 let r = reduce(&family(
@@ -2959,7 +3148,8 @@ mod tests {
                     exponents.clone(),
                 ))
                 .unwrap()
-                .simplify();
+                .simplify()
+                .unwrap();
                 assert_eq!(r.terms.len(), 1, "{exponents:?}");
                 let (got, master) = &r.terms[0];
                 assert_eq!(master, &MasterIntegral::Tadpole { m_sq: mass.clone() });
@@ -2982,10 +3172,12 @@ mod tests {
             vec![2, 1, 1],
         ))
         .unwrap()
-        .simplify();
+        .simplify()
+        .unwrap();
         let bubble = reduce(&family(vec![one(), one()], vec![s.clone()], vec![3, 1]))
             .unwrap()
-            .simplify();
+            .simplify()
+            .unwrap();
         assert_eq!(merged.terms.len(), bubble.terms.len());
         for ((c1, m1), (c2, m2)) in merged.terms.iter().zip(&bubble.terms) {
             assert_eq!(m1, m2);
@@ -2997,7 +3189,7 @@ mod tests {
             vec![Atom::Zero, Atom::Zero, Atom::num(2) / Atom::num(5)],
             vec![2, 1, 1],
         ));
-        assert!(kept.is_none());
+        assert!(kept.unwrap().is_none());
     }
 
     #[test]
@@ -3283,7 +3475,7 @@ mod limit_tests {
             *s = d.clone();
             deltas.push(d);
         }
-        let mut terms = reduce_core(&reg).terms;
+        let mut terms = reduce_core(&reg).unwrap().terms;
         for d in deltas.iter().rev() {
             terms = (terms.into_iter())
                 .map(|(c, m)| {
