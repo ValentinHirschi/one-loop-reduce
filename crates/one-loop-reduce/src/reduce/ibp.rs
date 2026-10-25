@@ -10,7 +10,9 @@ use symbolica::atom::{Atom, AtomCore};
 use symbolica::domains::integer::Z;
 use symbolica::domains::rational::Q;
 
-use super::{Rp, add_scaled, den_symbol, extract_monomials, loop_dots_to_vars};
+use super::{
+    Rp, add_scaled, checked_index_subtract, den_symbol, extract_monomials, loop_dots_to_vars,
+};
 use super::{modified_cayley, reduce_cayley};
 use crate::OneLoopError;
 use crate::masters::MasterIntegral;
@@ -214,8 +216,15 @@ pub(super) fn reduce_exact(
     let exps = &family.powers;
     let integrals: Vec<Index> = terms
         .iter()
-        .map(|(powers, _)| exps.iter().zip(powers).map(|(a, p)| a - p).collect())
-        .collect();
+        .map(|(powers, _)| {
+            exps.iter()
+                .zip(powers)
+                .map(|(a, p)| {
+                    checked_index_subtract(*a, *p, "routing numerator powers into IBP indices")
+                })
+                .collect::<Result<Index, OneLoopError>>()
+        })
+        .collect::<Result<Vec<_>, OneLoopError>>()?;
 
     // Reduce each integral to masters, widening the seeds if one does not close.
     let dots = integrals.iter().map(|a| key(a).1).max().unwrap_or(0);
@@ -280,6 +289,19 @@ mod tests {
                 matches!(super::sector_count(arity), Err(crate::OneLoopError::InvalidFamily(message)) if message.contains("u32 sector-mask"))
             );
         }
+    }
+
+    #[test]
+    fn numerator_index_underflow_is_reported_before_ibp_enumeration() {
+        crate::ensure_symbolica_license();
+        let numerator = dot(&Atom::var(S.k), &Atom::var(S.k));
+        let family = family(vec![n(1), n(2)], vec![n(-3)], vec![i32::MIN, 1], numerator);
+        let error = reduce_exact(&family).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::OneLoopError::UnsupportedNumerator { reason }
+                if reason.contains("i32") && reason.contains("2147483649")
+        ));
     }
 
     /// Compare two reductions, writing `B0(0,m,m) = (d-2)/(2m^2) A0(m)` first:

@@ -70,9 +70,11 @@ Exact master formulas and analytic-branch selection are oneloopmaster's; see its
   current thread and checks any enclosing Symbolica RSS/time resource budget.
   WebAssembly uses the same helper for its linear-memory data stack; its VM
   controls the separate call-stack capacity.
-- Numerator degree is at most 20 because the coefficient extraction uses an
-  `i64` factorial. The exact IBP fallback also requires fewer than 32 propagators
-  for its `u32` sector-mask representation; an unsupported width returns an error.
+- Polynomial numerator coefficients use exact arbitrary-size factorials. The
+  native `i32` exponent/index representation is checked; non-polynomial powers
+  and actual storage overflow return errors.
+- The exact IBP fallback requires fewer than 32 propagators for its `u32`
+  sector-mask representation; an unsupported width returns an error.
 - With five or more propagators the reduction drops an `O(ε)` term and needs
   four-dimensional external kinematics.
 - Where the regulated on-shell limit does not exist, an exact IBP solve at the

@@ -1,6 +1,6 @@
 use symbolica::atom::{Atom, AtomCore, AtomView, Symbol};
 use symbolica::coefficient::CoefficientView;
-use symbolica::domains::integer::{IntegerRing, Z};
+use symbolica::domains::integer::{Integer, IntegerRing, Z};
 use symbolica::domains::rational::Q;
 use symbolica::domains::rational_polynomial::{RationalPolynomial, RationalPolynomialField};
 use symbolica::symbol;
@@ -36,10 +36,6 @@ impl Reduction {
 /// Ordinary reduction has no such ceiling. Native recursion grows its stack
 /// on the current thread and honors the enclosing RAM/time resource budget.
 pub const MAX_TOTAL_INDEX: i32 = 32;
-
-/// The largest total degree of a numerator in `dot(k,k)` and `dot(k,q_i)`.
-/// Powers are peeled off with an `i64` factorial, which holds up to `20!`.
-pub const MAX_NUMERATOR_DEGREE: u32 = 20;
 
 /// Reduce a one-loop integral family to the scalar masters `A0`/`B0`/`C0`/`D0`.
 ///
@@ -183,56 +179,146 @@ fn check_numerator(numerator: &Atom, n: usize) -> Result<(), OneLoopError> {
             "loop momentum outside dot(k,k) and dot(k,q1..q{n_ext}): {numerator}"
         ));
     }
-    let expanded = poly.expand();
+    let variables = vars.into_iter().map(Atom::var).collect::<Vec<_>>();
+    validate_polynomial_exponents(&poly, &variables, "validating the loop numerator")
+}
+
+pub(crate) fn exponent_storage_error(
+    operation: &str,
+    value: impl std::fmt::Display,
+) -> OneLoopError {
+    OneLoopError::UnsupportedNumerator {
+        reason: format!(
+            "i32 exponent storage overflow while {operation}: {value} is not representable in this implementation's i32 exponent/index storage"
+        ),
+    }
+}
+
+pub(crate) fn checked_exponent_add(a: i32, b: i32, operation: &str) -> Result<i32, OneLoopError> {
+    a.checked_add(b)
+        .ok_or_else(|| exponent_storage_error(operation, i64::from(a) + i64::from(b)))
+}
+
+pub(crate) fn checked_index_subtract(
+    a: i32,
+    power: i32,
+    operation: &str,
+) -> Result<i32, OneLoopError> {
+    a.checked_sub(power)
+        .ok_or_else(|| exponent_storage_error(operation, i64::from(a) - i64::from(power)))
+}
+
+pub(crate) fn checked_nonnegative_exponent(
+    exponent: AtomView<'_>,
+    operation: &str,
+) -> Result<i32, OneLoopError> {
+    if let Ok(value) = i32::try_from(exponent)
+        && value >= 0
+    {
+        return Ok(value);
+    }
+    let nonnegative_integer = match exponent {
+        AtomView::Num(number) => match number.get_coeff_view() {
+            CoefficientView::Natural(value, 1, 0, _) => value >= 0,
+            CoefficientView::Large(real, imaginary) => {
+                let real = real.to_rat();
+                imaginary.is_zero() && real.is_integer() && !real.is_negative()
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    if nonnegative_integer {
+        Err(exponent_storage_error(operation, exponent))
+    } else {
+        Err(OneLoopError::UnsupportedNumerator {
+            reason: format!(
+                "numerator must be polynomial in the loop scalar products: exponent {exponent} is not a nonnegative integer"
+            ),
+        })
+    }
+}
+
+fn contains_polynomial_variable(expression: AtomView<'_>, variables: &[Atom]) -> bool {
+    let mut found = false;
+    expression.visitor(&mut |node| {
+        found |= variables.iter().any(|variable| node == variable.as_view());
+        !found
+    });
+    found
+}
+
+/// Check the exponent storage used by coefficient collection and `DotMono`.
+/// Variables can be whole scalar-product atoms, rather than just symbols.
+/// Ordinary Atom expansion precedes monomial inspection; no infallible
+/// fixed-exponent polynomial conversion is used to validate its own input.
+pub(crate) fn validate_polynomial_exponents(
+    expression: &Atom,
+    variables: &[Atom],
+    operation: &str,
+) -> Result<(), OneLoopError> {
+    let mut error = None;
+    expression.visitor(&mut |node| {
+        if error.is_some() {
+            return false;
+        }
+        if let AtomView::Pow(power) = node {
+            let (base, exponent) = power.get_base_exp();
+            if contains_polynomial_variable(exponent, variables) {
+                error = Some(OneLoopError::UnsupportedNumerator {
+                    reason: "numerator must be polynomial in the loop scalar products".into(),
+                });
+                return false;
+            }
+            if contains_polynomial_variable(base, variables)
+                && let Err(failure) = checked_nonnegative_exponent(exponent, operation)
+            {
+                error = Some(failure);
+                return false;
+            }
+        }
+        true
+    });
+    if let Some(error) = error {
+        return Err(error);
+    }
+
+    let expanded = expression.expand();
     let terms = match expanded.as_view() {
-        AtomView::Add(a) => a.iter().collect(),
+        AtomView::Add(sum) => sum.iter().collect::<Vec<_>>(),
         term => vec![term],
     };
     for term in terms {
+        resources::checkpoint()?;
         let factors = match term {
-            AtomView::Mul(m) => m.iter().collect(),
+            AtomView::Mul(product) => product.iter().collect::<Vec<_>>(),
             factor => vec![factor],
         };
-        let mut degree = 0;
-        for f in factors {
-            if vars.iter().any(|&v| f.contains_symbol(v)) {
-                let Some(e) = var_power(f, &vars) else {
-                    return unsupported(format!("not polynomial in the loop dots: {numerator}"));
-                };
-                if e > MAX_NUMERATOR_DEGREE - degree {
-                    return unsupported(format!(
-                        "degree {} exceeds the i64 factorial bound {MAX_NUMERATOR_DEGREE}",
-                        u64::from(degree) + u64::from(e)
-                    ));
+        let mut degrees = vec![0i32; variables.len()];
+        for factor in factors {
+            let (base, exponent) = match factor {
+                AtomView::Pow(power) => {
+                    let (base, exponent) = power.get_base_exp();
+                    if !contains_polynomial_variable(base, variables) {
+                        continue;
+                    }
+                    (base, checked_nonnegative_exponent(exponent, operation)?)
                 }
-                degree += e;
+                factor => (factor, 1),
+            };
+            if let Some(index) = variables
+                .iter()
+                .position(|variable| variable.as_view() == base)
+            {
+                degrees[index] = checked_exponent_add(degrees[index], exponent, operation)?;
+            } else if contains_polynomial_variable(factor, variables) {
+                return Err(OneLoopError::UnsupportedNumerator {
+                    reason: "numerator must be polynomial in the loop scalar products".into(),
+                });
             }
-        }
-        if degree > MAX_NUMERATOR_DEGREE {
-            return unsupported(format!(
-                "degree {degree} exceeds the bound {MAX_NUMERATOR_DEGREE}"
-            ));
         }
     }
     Ok(())
-}
-
-/// `e` for a factor `v^e` with `v` in `vars` and `e` a positive integer.
-fn var_power(f: AtomView, vars: &[Symbol]) -> Option<u32> {
-    let is_var = |a: AtomView| matches!(a, AtomView::Var(v) if vars.contains(&v.get_symbol()));
-    match f {
-        AtomView::Var(_) if is_var(f) => Some(1),
-        AtomView::Pow(p) => match p.get_base_exp() {
-            (base, AtomView::Num(e)) if is_var(base) => match e.get_coeff_view() {
-                CoefficientView::Natural(num, 1, 0, _) => {
-                    u32::try_from(num).ok().filter(|&e| e > 0)
-                }
-                _ => None,
-            },
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 /// Merge lines that are the same denominator, `D_i^a D_j^b = D_i^(a+b)`. Equal
@@ -891,6 +977,8 @@ fn numerator_to_monos(numerator: &Atom, n_ext: usize) -> Result<Vec<DotMono>, On
 
 // Monomials of a polynomial in `vars`
 fn extract_monomials(expr: &Atom, vars: &[Symbol]) -> Result<Vec<DotMono>, OneLoopError> {
+    let variables = vars.iter().copied().map(Atom::var).collect::<Vec<_>>();
+    validate_polynomial_exponents(expr, &variables, "extracting numerator monomials")?;
     fn rec(
         expr: &Atom,
         vars: &[Symbol],
@@ -910,14 +998,14 @@ fn extract_monomials(expr: &Atom, vars: &[Symbol]) -> Result<Vec<DotMono>, OneLo
             // Peel off powers of `v` one at a time via Taylor coefficients:
             //   coeff of v^c = (1/c!) d^c/dv^c expr |_{v=0}
             let mut deriv = expr.clone();
-            let mut factorial: i64 = 1;
+            let mut factorial = Integer::from(1);
             let mut c = 0i32;
             loop {
                 resources::checkpoint()?;
                 // coefficient of v^c is (deriv with v->0) / factorial
                 let at_zero = deriv.replace(vatom.to_pattern()).with(Atom::Zero);
                 if at_zero != Atom::Zero {
-                    let coeff = at_zero / Atom::num(factorial);
+                    let coeff = at_zero / Atom::num(factorial.clone());
                     exps[idx] = c;
                     rec(&coeff, vars, idx + 1, exps, out)?;
                 }
@@ -927,15 +1015,8 @@ fn extract_monomials(expr: &Atom, vars: &[Symbol]) -> Result<Vec<DotMono>, OneLo
                     break;
                 }
                 deriv = next;
-                c += 1;
-                if c > MAX_NUMERATOR_DEGREE as i32 {
-                    return Err(OneLoopError::UnsupportedNumerator {
-                        reason: format!(
-                            "numerator degree in one variable exceeds the i64 factorial bound ({MAX_NUMERATOR_DEGREE})"
-                        ),
-                    });
-                }
-                factorial *= i64::from(c);
+                c = checked_exponent_add(c, 1, "advancing the coefficient-extraction derivative")?;
+                factorial *= Integer::from(c);
             }
             exps[idx] = 0;
             Ok(())
@@ -1304,7 +1385,11 @@ fn mono_mul(a: &[DotMono], b: &[DotMono]) -> Result<Vec<DotMono>, OneLoopError> 
     for (ea, ca) in a {
         for (eb, cb) in b {
             resources::checkpoint()?;
-            let e: Vec<i32> = ea.iter().zip(eb).map(|(x, y)| x + y).collect();
+            let e = ea
+                .iter()
+                .zip(eb)
+                .map(|(&x, &y)| checked_exponent_add(x, y, "multiplying numerator monomials"))
+                .collect::<Result<Vec<_>, _>>()?;
             push_mono(&mut out, e, ca * cb);
         }
     }
@@ -1470,7 +1555,7 @@ fn reduce_num_inner(topo: &Topo, numerator_monos: &[DotMono]) -> Result<Masters,
         resources::checkpoint()?;
         let mut b = topo.a.clone();
         for i in 0..n_lines {
-            b[i] -= cexp[i];
+            b[i] = checked_index_subtract(b[i], cexp[i], "applying numerator denominator powers")?;
         }
         if b.iter().all(|&x| x >= 0) {
             // pure propagator shift
@@ -1485,7 +1570,7 @@ fn reduce_num_inner(topo: &Topo, numerator_monos: &[DotMono]) -> Result<Masters,
             for (i, &power) in b.iter().enumerate().take(n_lines) {
                 if power < 0 {
                     let di = di_as_dots(&topo.r_coeffs[i], &topo.masses[i], &*topo.base_gram);
-                    for _ in 0..(-power) {
+                    for _ in 0..(-i64::from(power)) {
                         residual = mono_mul(&residual, &di)?;
                     }
                 }
@@ -3245,11 +3330,6 @@ mod tests {
                 bubble(),
                 dot(&k, &q(1)).pow(Atom::num(1) / Atom::num(2)),
             ),
-            (
-                "dot(k,k)^21",
-                family(vec![Atom::num(1)], vec![], vec![1]),
-                dot(&k, &k).pow(Atom::num(21)),
-            ),
         ];
         for (what, fam, num) in cases {
             let err = reduce(&with_numerator(fam, num)).unwrap_err();
@@ -3277,13 +3357,152 @@ mod tests {
         let tadpole = family(vec![Atom::num(1)], vec![], vec![1]);
         let r = reduce(&with_numerator(tadpole, dot(&k, &q(3)).pow(Atom::num(2)))).unwrap();
         assert_eq!(r.terms.len(), 1);
-        // The degree bound is inclusive.
+        // Degree twenty remains supported after removing the factorial ceiling.
         let tadpole = family(vec![Atom::num(1)], vec![], vec![1]);
-        let r = reduce(&with_numerator(
-            tadpole,
-            dot(&k, &k).pow(Atom::num(i64::from(super::MAX_NUMERATOR_DEGREE))),
-        ));
+        let r = reduce(&with_numerator(tadpole, dot(&k, &k).pow(Atom::num(20))));
         assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[test]
+    fn exact_coefficients_beyond_machine_factorials() {
+        crate::ensure_symbolica_license();
+        let x = symbol!("exact_numerator_test::x");
+        let y = symbol!("exact_numerator_test::y");
+        for degree in [21, 22] {
+            let expression =
+                Atom::num(3) * Atom::var(x).pow(Atom::num(degree)) * Atom::var(y).pow(Atom::num(2))
+                    + Atom::num(5);
+            let terms = super::extract_monomials(&expression, &[x, y])
+                .unwrap()
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(terms.len(), 2);
+            assert_eq!(terms[&vec![degree, 2]], Atom::num(3));
+            assert_eq!(terms[&vec![0, 0]], Atom::num(5));
+        }
+    }
+
+    #[test]
+    fn massive_tadpole_numerator_degrees_twenty_one_and_twenty_two() {
+        crate::ensure_symbolica_license();
+        let mass_squared = Atom::num(2);
+        for degree in [21, 22] {
+            // Polynomial terms integrate to zero in dimensional regularization:
+            // (k.k)^n / (k.k-m^2) = (m^2)^n / (k.k-m^2) + polynomial.
+            let result = reduce(&with_numerator(
+                family(vec![mass_squared.clone()], vec![], vec![1]),
+                super::dot_ll().pow(Atom::num(degree)),
+            ))
+            .unwrap()
+            .simplify()
+            .unwrap();
+            assert_eq!(result.terms.len(), 1);
+            assert_eq!(result.terms[0].0, mass_squared.pow(Atom::num(degree)));
+            assert!(matches!(&result.terms[0].1,
+                MasterIntegral::Tadpole { m_sq } if *m_sq == mass_squared));
+        }
+    }
+
+    #[test]
+    fn transformed_denominator_degrees_combine_without_a_factorial_cap() {
+        crate::ensure_symbolica_license();
+        let topology = super::bubble_topo(1, 1, &Atom::num(5), &Atom::num(2), &Atom::num(3));
+        for (second_degree, expected) in [(10, Atom::num((1, 1024))), (11, Atom::num((-1, 2048)))] {
+            let input =
+                super::dot_ll().pow(Atom::num(11)) * super::dot_lq(0).pow(Atom::num(second_degree));
+            super::check_numerator(&input, 2).unwrap();
+            // k.k = D1+2 and k.q = (D2-D1-4)/2. The leading D1
+            // coefficient is independently (-1)^m / 2^m, at degree 11+m.
+            let transformed = topology.rule_ll.pow(Atom::num(11))
+                * topology.rule_lq[0].pow(Atom::num(second_degree));
+            let terms = super::extract_monomials(&transformed, &topology.den_syms)
+                .unwrap()
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(terms[&vec![11 + second_degree, 0]], expected);
+        }
+    }
+
+    #[test]
+    fn exponent_storage_boundaries_are_checked_without_large_reductions() {
+        crate::ensure_symbolica_license();
+        let x = Atom::var(symbol!("exponent_storage_test::x"));
+        let y = Atom::var(symbol!("exponent_storage_test::y"));
+        let largest = Atom::num(i32::MAX);
+        assert_eq!(
+            super::checked_nonnegative_exponent(largest.as_view(), "testing a literal").unwrap(),
+            i32::MAX,
+        );
+        for exponent in [
+            Atom::num(i64::from(i32::MAX) + 1),
+            Atom::num(symbolica::domains::integer::Integer::factorial(50)),
+        ] {
+            let error =
+                super::checked_nonnegative_exponent(exponent.as_view(), "testing a literal")
+                    .unwrap_err();
+            assert!(error.to_string().contains("i32 exponent storage overflow"));
+            let error = super::validate_polynomial_exponents(
+                &x.pow(&exponent),
+                std::slice::from_ref(&x),
+                "testing coefficient collection",
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("i32 exponent storage overflow"));
+        }
+        // Total degree is not the coordinate storage bound: both powers fit.
+        super::validate_polynomial_exponents(
+            &(x.pow(&largest) * &y),
+            &[x.clone(), y],
+            "testing independent coordinates",
+        )
+        .unwrap();
+        assert_eq!(
+            super::mono_mul(
+                &[(vec![i32::MAX], Atom::num(1))],
+                &[(vec![0], Atom::num(1))]
+            )
+            .unwrap()[0]
+                .0,
+            vec![i32::MAX],
+        );
+        let error = super::mono_mul(
+            &[(vec![i32::MAX], Atom::num(1))],
+            &[(vec![1], Atom::num(1))],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("2147483648"));
+        assert_eq!(
+            super::checked_index_subtract(0, i32::MAX, "testing a shift").unwrap(),
+            -i32::MAX
+        );
+        let error = super::checked_index_subtract(i32::MIN, 1, "testing a shift").unwrap_err();
+        assert!(error.to_string().contains("-2147483649"));
+    }
+
+    #[test]
+    fn coefficient_collection_checks_whole_atom_variables_and_nonpolynomial_powers() {
+        crate::ensure_symbolica_license();
+        let variable = function!(symbol!("coefficient_guard_test::dot"), 1, 2);
+        super::validate_polynomial_exponents(
+            &variable.pow(Atom::num(22)),
+            std::slice::from_ref(&variable),
+            "checking a scalar-product atom",
+        )
+        .unwrap();
+        for expression in [
+            variable.pow(Atom::num(-1)),
+            variable.pow(Atom::num((1, 2))),
+            Atom::num(2).pow(&variable),
+        ] {
+            let error = super::validate_polynomial_exponents(
+                &expression,
+                std::slice::from_ref(&variable),
+                "checking polynomial syntax",
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("must be polynomial"));
+            assert!(!error.to_string().contains("storage overflow"));
+        }
     }
 
     /// The reducer's scratch variables are fixed, interned names; an input using

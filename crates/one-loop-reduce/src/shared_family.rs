@@ -15,7 +15,10 @@ use symbolica::{
 use crate::{
     OneLoopError,
     recurrence::{RecurrenceInput, ReductionOptions},
-    reduce::{MAX_NUMERATOR_DEGREE, Reduction},
+    reduce::{
+        Reduction, checked_exponent_add, checked_nonnegative_exponent, exponent_storage_error,
+        validate_polynomial_exponents,
+    },
     symbols::{S, scalar_product, validate_namespace},
 };
 
@@ -70,16 +73,17 @@ impl ReductionOptions {
             resources::checkpoint()?;
             validate_namespace(input)?;
         }
-        // Enforce the factorial representation bound before negative powers expand.
+        // Check actual loop-coordinate storage before negative powers expand.
         // Pure scalar denominators are coefficients, not recurrence indices.
         let mut positive_total = 0i128;
         for (denominator, power) in family.denominators().iter().zip(powers) {
             resources::checkpoint()?;
             if contains_loop(denominator, &family.loop_momenta()[0]) {
-                if i64::from(*power) < -i64::from(MAX_NUMERATOR_DEGREE) {
-                    return Err(invalid(format!(
-                        "a negative power beyond -{MAX_NUMERATOR_DEGREE} exceeds the numerator degree bound"
-                    )));
+                if *power < 0 && power.checked_neg().is_none() {
+                    return Err(exponent_storage_error(
+                        "moving a negative propagator power into loop-coordinate storage",
+                        -i64::from(*power),
+                    ));
                 }
                 positive_total += i128::from((*power).max(0));
             }
@@ -254,9 +258,10 @@ fn monomial_powers(key: AtomView<'_>, variables: &[Atom]) -> Result<Vec<i32>, On
                 let (base, exponent) = power.get_base_exp();
                 (
                     base,
-                    i32::try_from(exponent).map_err(|_| {
-                        invalid("numerator must be polynomial in the shared loop scalar products")
-                    })?,
+                    checked_nonnegative_exponent(
+                        exponent,
+                        "reading a shared loop scalar-product exponent",
+                    )?,
                 )
             }
             _ => (factor, 1),
@@ -267,17 +272,21 @@ fn monomial_powers(key: AtomView<'_>, variables: &[Atom]) -> Result<Vec<i32>, On
             .ok_or_else(|| {
                 invalid("numerator must be polynomial in the shared loop scalar products")
             })?;
-        if !(0..=MAX_NUMERATOR_DEGREE as i32).contains(&exponent) {
-            return Err(invalid(format!(
-                "numerator degree in each loop scalar product must be 0..={MAX_NUMERATOR_DEGREE}"
-            )));
-        }
-        powers[index] += exponent;
+        powers[index] = checked_exponent_add(
+            powers[index],
+            exponent,
+            "combining shared loop scalar-product powers",
+        )?;
     }
     Ok(powers)
 }
 
 fn validate_numerator(family: &SharedFamily, numerator: &Atom) -> Result<(), OneLoopError> {
+    validate_polynomial_exponents(
+        numerator,
+        family.scalar_products(),
+        "extracting the shared-family numerator",
+    )?;
     for (key, coefficient) in numerator.coefficient_list::<i32>(family.scalar_products()) {
         monomial_powers(key.as_view(), family.scalar_products())?;
         if contains_loop(&coefficient, &family.loop_momenta()[0]) {
@@ -315,9 +324,9 @@ fn reduce_sector(
     let mut exponents = Vec::new();
     for (index, power) in powers.iter().copied().enumerate() {
         if power < 0 {
-            let degree = power
-                .checked_neg()
-                .ok_or_else(|| invalid("negative numerator power is too large"))?;
+            // Widen before negating. Scalar-only coefficients are not restricted
+            // by the loop-monomial exponent representation checked at ingress.
+            let degree = -i64::from(power);
             numerator *= family.denominators()[index].pow(degree);
         } else if power > 0 {
             let Some(quadratic) = family.quadratic_denominator(index).map_err(invalid)? else {
@@ -419,6 +428,11 @@ fn reduce_sector(
     for (momentum, image) in external.iter().zip(images) {
         rules.push(image - kin.scalar_product(&origin, momentum).map_err(invalid)?);
     }
+    validate_polynomial_exponents(
+        &numerator,
+        family.scalar_products(),
+        "transforming the shared-family numerator",
+    )?;
     let mut transformed = Atom::Zero;
     for (key, coefficient) in numerator.coefficient_list::<i32>(family.scalar_products()) {
         let powers = monomial_powers(key.as_view(), family.scalar_products())?;
@@ -493,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_power_limits_are_checked_before_expansion() {
+    fn signed_power_storage_is_checked_before_expansion() {
         crate::ensure_symbolica_license();
         let dimension = Atom::var(symbol!("shared_reduction_test::D"));
         let momentum = Atom::var(symbol!("shared_reduction_test::ell"));
@@ -504,8 +518,21 @@ mod tests {
         let squared = kin.scalar_product(&momentum, &momentum).unwrap();
         let family =
             SharedFamily::new(vec![momentum], vec![], vec![squared - Atom::num(2)], &kin).unwrap();
-        for power in [i32::MIN, -21] {
-            assert!(reduce_family(&family, &[power], &Atom::num(1)).is_err());
+        let error = reduce_family(&family, &[i32::MIN], &Atom::one()).unwrap_err();
+        assert!(matches!(
+            error,
+            OneLoopError::UnsupportedNumerator { reason }
+                if reason.contains("i32") && reason.contains("2147483648")
+        ));
+        for power in [-21, -22] {
+            // Negative powers are polynomial insertions; without a remaining
+            // propagator every resulting loop integral is scaleless.
+            assert!(
+                reduce_family(&family, &[power], &Atom::one())
+                    .unwrap()
+                    .terms
+                    .is_empty()
+            );
         }
         let diagnostic = ReductionOptions::default().with_diagnostics();
         for power in [33, i32::MAX] {
@@ -516,6 +543,79 @@ mod tests {
             );
         }
         assert!(reduce_family(&family, &[33], &Atom::one()).is_ok());
+    }
+
+    #[test]
+    fn shared_tadpole_accepts_exact_numerator_degrees_above_twenty() {
+        crate::ensure_symbolica_license();
+        let dimension = Atom::var(symbol!("shared_degree_test::D"));
+        let momentum = Atom::var(symbol!("shared_degree_test::ell"));
+        let kin = Kinematics::in_dimension(&dimension)
+            .unwrap()
+            .with_momenta([momentum.clone()])
+            .unwrap();
+        let squared = kin.scalar_product(&momentum, &momentum).unwrap();
+        let family =
+            SharedFamily::new(vec![momentum], vec![], vec![&squared - Atom::num(2)], &kin).unwrap();
+        for degree in [21, 22] {
+            let reduced = reduce_family(&family, &[1], &squared.pow(degree)).unwrap();
+            assert_eq!(
+                reduced.terms,
+                vec![(
+                    Atom::num(2).pow(degree),
+                    MasterIntegral::Tadpole { m_sq: Atom::num(2) }
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_unit_denominator_accepts_the_minimum_signed_power() {
+        crate::ensure_symbolica_license();
+        let dimension = Atom::var(symbol!("scalar_power_test::D"));
+        let momentum = Atom::var(symbol!("scalar_power_test::ell"));
+        let kin = Kinematics::in_dimension(&dimension)
+            .unwrap()
+            .with_momenta([momentum.clone()])
+            .unwrap();
+        let squared = kin.scalar_product(&momentum, &momentum).unwrap();
+        let family = SharedFamily::new(
+            vec![momentum],
+            vec![],
+            vec![squared - Atom::num(2), Atom::one()],
+            &kin,
+        )
+        .unwrap();
+        // The unit factor has no loop-coordinate exponent and does not create
+        // a large integer value or a large polynomial when its power is moved.
+        let reduced = reduce_family(&family, &[1, i32::MIN], &Atom::one()).unwrap();
+        assert_eq!(
+            reduced.terms,
+            vec![(Atom::one(), MasterIntegral::Tadpole { m_sq: Atom::num(2) })]
+        );
+    }
+
+    #[test]
+    fn unrepresentable_loop_exponent_is_rejected_before_polynomial_extraction() {
+        crate::ensure_symbolica_license();
+        let dimension = Atom::var(symbol!("shared_exponent_test::D"));
+        let momentum = Atom::var(symbol!("shared_exponent_test::ell"));
+        let kin = Kinematics::in_dimension(&dimension)
+            .unwrap()
+            .with_momenta([momentum.clone()])
+            .unwrap();
+        let squared = kin.scalar_product(&momentum, &momentum).unwrap();
+        let family =
+            SharedFamily::new(vec![momentum], vec![], vec![&squared - Atom::num(2)], &kin).unwrap();
+        // A compact literal tests the actual boundary without differentiating
+        // or expanding billions of terms.
+        let numerator = squared.pow(i64::from(i32::MAX) + 1);
+        let error = reduce_family(&family, &[1], &numerator).unwrap_err();
+        assert!(matches!(
+            error,
+            OneLoopError::UnsupportedNumerator { reason }
+                if reason.contains("i32") && reason.contains("2147483648")
+        ));
     }
 
     #[test]
