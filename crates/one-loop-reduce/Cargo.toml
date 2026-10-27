@@ -9,8 +9,8 @@ description = "One-loop IBP reduction of Feynman integrals to the scalar master 
 name = "oneloopreduce"
 
 [dependencies]
-feynkit-graph = { git = "https://github.com/alphal00p/gammaloop", branch = "preserve-canonical-numerator-interfaces", default-features = false }
-feynkit-kinematics = { git = "https://github.com/alphal00p/gammaloop", branch = "preserve-canonical-numerator-interfaces", default-features = false }
+feynkit-graph = { git = "https://github.com/alphal00p/gammaloop", rev = "e90e78ae9b05c2813b462157a83073b0740419f4", default-features = false }
+feynkit-kinematics = { git = "https://github.com/alphal00p/gammaloop", rev = "e90e78ae9b05c2813b462157a83073b0740419f4", default-features = false }
 # Must stay a crates.io version requirement -- see the note in the workspace
 # root Cargo.toml.
 #
