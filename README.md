@@ -99,9 +99,10 @@ The entry point is
 `oneloopreduce::reduce_family(&feynkit_graph::IntegralFamily, powers, numerator)`;
 `OneLoopMasters.symbol_with_scale(&master, &mu_squared)` builds the master calls.
 
-FeynKit (`alphal00p/gammaloop`, branch `feynkit`) and oneloopmaster (branch `main`)
-are git dependencies on the same branches the consuming root uses, so Cargo links one
-copy of each; `Cargo.lock` records the exact commits. Symbolica is the released 3.0.1;
+FeynKit (`alphal00p/gammaloop`) is pinned to the public shared-owner revision
+`1f4f2492d818c5bebdbf34af4e4dd3b504756aef`; consumers must use the same git URL and
+revision to share its Rust types. oneloopmaster uses branch `main`, and `Cargo.lock`
+records its exact commit. Symbolica is the released 3.0.1;
 consuming roots must resolve a single copy. WebAssembly builds leave out the native
 numerical dependencies.
 
